@@ -1,0 +1,25 @@
+# Ruta local a ffmpeg, para máquinas donde no está en el PATH. Es de cada uno: no se publica.
+ffmpeg.local
+
+# Documento de diseño interno. Lo que valía la pena de él está contado en el README.
+CONTRATO.md
+
+# Reportes generados. Llevan rutas absolutas de la máquina donde se corrió: nunca se publican.
+out/
+
+# Audio de trabajo. Las señales del harness SÍ van al repo (son sintéticas y se regeneran
+# desde código); esta carpeta es material propio y no forma parte de la herramienta.
+samples/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editores y sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
