@@ -1,0 +1,48 @@
+# Runs the full harness on every push and pull request, across the OS × Python matrix.
+#
+# This workflow is also the source of truth for the README's platform claims: an OS is
+# only listed as supported after this matrix has actually passed on it. ffmpeg is
+# installed explicitly on every runner — some images ship it, some don't, and a test
+# that depends on what happens to be preinstalled is not a test.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  harness:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Show ffmpeg version
+        run: ffmpeg -version
+
+      # No pip install: the tool has no third-party Python dependencies, and the
+      # harness proving that on a bare runner is part of the point.
+      - name: Run harness
+        run: python harness/run_harness.py

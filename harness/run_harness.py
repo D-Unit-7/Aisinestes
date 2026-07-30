@@ -5,6 +5,10 @@ run_harness.py — truth assertions for Aisinestes.
 Runs the instrument (aisinestes.*) against the synthetic signals of make_signals.py,
 about which we know EVERYTHING beforehand, and checks that it measures the truth.
 
+Most cases call the modules directly. The ones about the exit code (family "exitcode")
+and about --brief (family "brief") run the real CLI in a child process instead: the gate
+IS the exit code, and no function call can prove what the command actually returns.
+
 House rule: **a test is only worth anything if it can fail**. We have already had a
 green harness with the bug still inside. That is why every family of assertions runs in
 two modes, through THE SAME function:
@@ -37,9 +41,13 @@ there: it forces the absence and verifies that those cases are reported as not r
 green.
 """
 
+import copy
+import json
 import math
 import os
+import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -47,6 +55,9 @@ import time
 BASE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(BASE)
 SIG_DIR = os.path.join(BASE, "signals")
+# Output folder for the cases that run the real CLI in a child process. It hangs off out/,
+# which is already gitignored, and each run wipes its own subfolder before starting.
+CLI_OUT = os.path.join(ROOT, "out", "_harness")
 
 # The project root goes first so the aisinestes package can be imported.
 if ROOT not in sys.path:
@@ -88,7 +99,12 @@ def _import(name):
         MISSING_REASON[name] = "%s: %s" % (type(e).__name__, e)
 
 
-for _m in ("wavio", "analyze", "ffreport", "targets"):
+# pipeline, compare and htmlreport are imported the same tolerant way as the rest: if one
+# of them is not there its cases have to come out NOT RUN, never PASS.
+MODULE_NAMES = ("wavio", "analyze", "ffreport", "targets", "pipeline", "compare",
+                "htmlreport")
+
+for _m in MODULE_NAMES:
     _import(_m)
 
 
@@ -203,6 +219,31 @@ def metrics(file_name, with_loudness=True):
         except Exception:
             pass   # the loudness case has its own assertion; nothing is covered up here
     return m
+
+
+# Absolute-path roots that must never show up in an output built to travel. The Windows
+# drive letter is caught by the regex below; these are the POSIX ones, and they include
+# the system directories ffmpeg quotes inside its own error text.
+POSIX_PATH_ROOTS = ("/home/", "/Users/", "/root/", "/tmp/", "/usr/", "/var/", "/opt/")
+
+
+def absolute_path_hint(text):
+    """Returns the token that gives an absolute path away inside `text`, or None.
+
+    The two outputs made to leave the machine — the brief and the HTML page — must not
+    carry the path they were measured from. This guard used to look only for a Windows
+    drive letter, which meant that on Linux and macOS it **could not fail**: a leaked
+    `/home/runner/...` matched nothing and the sweep passed while testing nothing. Since
+    the CI matrix certifies exactly those two platforms, the check had to learn their
+    shape of an absolute path before that green could mean anything.
+    """
+    match = re.search(r"[A-Za-z]:[\\/]", text)
+    if match:
+        return match.group(0)
+    for root in POSIX_PATH_ROOTS:
+        if root in text:
+            return root
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +467,646 @@ def chk_fx_flags(file_name, genre, required_flags=(), no_flags=False):
                                                   len(flags), summary)
 
 
+# ---------------------------------------------------------------------------
+# CLI cases: the gate is the exit code, so the exit code gets tested by running
+# the real command in a child process, not by calling functions.
+# ---------------------------------------------------------------------------
+
+CLI_TIMEOUT = 60.0      # per child process; the case timeout has to be LARGER than this
+                        # or the harness thread would give up while the child keeps running.
+
+
+def run_cli(file_name, genre, brief=False, break_ffmpeg=False):
+    """Runs `python -m aisinestes` on a signal and returns what came out of it.
+
+    Returns {"code", "stdout", "stderr", "folder", "report"}.
+
+    break_ffmpeg=True points AISINESTES_FFMPEG at the WAV itself: a file that EXISTS (so
+    _find_ffmpeg stops there and does not fall back to ffmpeg.local or to the PATH) but
+    that cannot be executed. That is the only reliable way to reproduce "no ffmpeg" on a
+    machine that does have it — pointing the variable at a path that does not exist would
+    simply be ignored and the real binary would be found anyway.
+    """
+    key = ("cli", file_name, genre, brief, break_ffmpeg)
+
+    def _run():
+        out_dir = os.path.join(CLI_OUT, "%s-%s%s%s" % (
+            os.path.splitext(file_name)[0], genre,
+            "-brief" if brief else "", "-noffmpeg" if break_ffmpeg else ""))
+        # Wiped first: otherwise a leftover report from an earlier run could pass for one
+        # this run never wrote.
+        shutil.rmtree(out_dir, ignore_errors=True)
+        env = dict(os.environ)
+        if break_ffmpeg:
+            env["AISINESTES_FFMPEG"] = signal_path(file_name)
+        cmd = [sys.executable, "-m", "aisinestes", signal_path(file_name),
+               "--genre", genre, "--out", out_dir]
+        if brief:
+            cmd.append("--brief")
+        proc = subprocess.run(cmd, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=CLI_TIMEOUT)
+        folder = os.path.join(out_dir, os.path.splitext(file_name)[0])
+        report = None
+        json_path = os.path.join(folder, "report.json")
+        if os.path.exists(json_path):
+            with open(json_path, "r", encoding="utf-8") as fh:
+                report = json.load(fh)
+        return {
+            "code": proc.returncode,
+            "stdout": proc.stdout.decode("utf-8", errors="replace"),
+            "stderr": proc.stderr.decode("utf-8", errors="replace"),
+            "folder": folder,
+            "report": report,
+        }
+
+    return _cache(key, _run)
+
+
+def chk_cli_exit(file_name, genre, expect_code, break_ffmpeg=False,
+                 expect_flags=None, expect_unmeasured=None):
+    """
+    Checks the exit code of the real CLI and that the verdict block in report.json says
+    the same thing. The two have to agree: an exit code nobody can explain from the report
+    is a gate nobody can trust.
+    expect_unmeasured: True = the list has to have something, False = it has to be empty.
+    """
+    got = run_cli(file_name, genre, break_ffmpeg=break_ffmpeg)
+    report = got["report"]
+    assert report is not None, ("%s (%s): no report.json was written in %s. stderr: %s"
+                                % (file_name, genre, got["folder"],
+                                   _one_line(got["stderr"], 200)))
+    verdict = report.get("verdict")
+    assert verdict is not None, ("%s: report.json has no 'verdict' block (keys: %s)"
+                                 % (file_name, sorted(report)))
+    assert got["code"] == expect_code, (
+        "%s (%s%s): the CLI returned %d and %d was expected. verdict=%s"
+        % (file_name, genre, ", ffmpeg broken" if break_ffmpeg else "",
+           got["code"], expect_code, _verdict_summary(verdict)))
+    assert verdict["exit_code"] == got["code"], (
+        "%s: verdict.exit_code = %r but the process returned %d"
+        % (file_name, verdict["exit_code"], got["code"]))
+    if expect_flags is not None:
+        assert verdict["flags"] == expect_flags, (
+            "%s (%s): verdict.flags = %d, expected %d"
+            % (file_name, genre, verdict["flags"], expect_flags))
+    if expect_unmeasured is True:
+        assert verdict["unmeasured"], (
+            "%s (%s): verdict.unmeasured is empty and something had to be missing there"
+            % (file_name, genre))
+    if expect_unmeasured is False:
+        assert not verdict["unmeasured"], (
+            "%s (%s): verdict.unmeasured is NOT empty -> %s"
+            % (file_name, genre, _one_line("; ".join(verdict["unmeasured"]), 200)))
+    return "%s (%s%s): exit %d, %s" % (
+        file_name, genre, ", ffmpeg broken" if break_ffmpeg else "",
+        got["code"], _verdict_summary(verdict))
+
+
+def chk_brief(file_name, genre, expect_verdict, expect_flag_lines, expect_code=None,
+              break_ffmpeg=False):
+    """
+    Parses the --brief output exactly as a machine reading it would: line by line.
+    Also checks that --brief did NOT stop the full report from being written, and that
+    the literal `exit=` line matches the code the process actually returned.
+    """
+    got = run_cli(file_name, genre, brief=True, break_ffmpeg=break_ffmpeg)
+    lines = [ln for ln in got["stdout"].splitlines() if ln.strip()]
+    assert lines, "%s: --brief printed nothing. stderr: %s" % (
+        file_name, _one_line(got["stderr"], 200))
+    assert len(lines) <= 20, "%s: the brief came out with %d lines, the cap is 20" % (
+        file_name, len(lines))
+
+    head = lines[0]
+    assert head.startswith("AISINESTES %s |" % file_name), (
+        "%s: the first line does not start with 'AISINESTES <basename> |' -> %r"
+        % (file_name, head))
+    first_field = head.split("|")[0]
+    assert "/" not in first_field and "\\" not in first_field, (
+        "%s: the brief header is leaking a path, it has to show only the basename -> %r"
+        % (file_name, head))
+    assert "genre=%s" % genre in head, "%s: 'genre=%s' is missing in %r" % (
+        file_name, genre, head)
+    version = (MODULES["targets"].GENRES.get(genre) or {}).get("version")
+    if version:
+        assert "genre=%s v%s" % (genre, version) in head, (
+            "%s: the profile version is missing in the header -> %r" % (file_name, head))
+
+    # No line of the brief may carry an absolute path — not the header, not the
+    # UNMEASURED reasons (ffmpeg's own words include full paths), not `files:`. The
+    # brief is the output made to be pasted elsewhere.
+    for line in lines:
+        hint = absolute_path_hint(line)
+        assert hint is None, (
+            "%s: the brief is leaking an absolute path (%r) -> %r"
+            % (file_name, hint, line))
+
+    assert lines[1].startswith("VERDICT: %s" % expect_verdict), (
+        "%s: expected 'VERDICT: %s' and got %r" % (file_name, expect_verdict, lines[1]))
+    flag_lines = [ln for ln in lines if ln.startswith("FLAG ")]
+    assert len(flag_lines) == expect_flag_lines, (
+        "%s: %d FLAG lines expected in the brief, there are %d -> %s"
+        % (file_name, expect_flag_lines, len(flag_lines),
+           _one_line(" / ".join(flag_lines), 300)))
+    assert any(ln.startswith("files: ") for ln in lines), (
+        "%s: the brief has no 'files:' line -> %r" % (file_name, lines))
+    assert lines[-1] == "exit=%d" % got["code"], (
+        "%s: the last brief line is %r and the process returned %d — a brief that lies "
+        "about its own exit code is worse than no brief"
+        % (file_name, lines[-1], got["code"]))
+    if expect_code is not None:
+        assert got["code"] == expect_code, (
+            "%s: the CLI returned %d and %d was expected" % (
+                file_name, got["code"], expect_code))
+    for name in ("report.json", "report.txt"):
+        assert os.path.exists(os.path.join(got["folder"], name)), (
+            "%s: --brief did not write %s (it has to write the same files as always)"
+            % (file_name, name))
+    return "%s (%s): %s | %d FLAG lines | %d lines | exit %d" % (
+        file_name, genre, lines[1], len(flag_lines), len(lines), got["code"])
+
+
+def chk_missing_file(expect_code):
+    """The classic error route: a file that does not exist has to come out as exit 2,
+    with a clear message on stderr — not a traceback, not a half-written report."""
+    ghost = os.path.join(CLI_OUT, "no-such-file.wav")
+    out_dir = os.path.join(CLI_OUT, "missing-file")
+    shutil.rmtree(out_dir, ignore_errors=True)
+    proc = subprocess.run([sys.executable, "-m", "aisinestes", ghost,
+                           "--genre", "fx-impact", "--out", out_dir],
+                          cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=CLI_TIMEOUT)
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    assert proc.returncode == expect_code, (
+        "missing file: the CLI returned %d and %d was expected. stderr: %s"
+        % (proc.returncode, expect_code, _one_line(stderr, 200)))
+    assert "ERROR" in stderr, (
+        "missing file: stderr carries no ERROR message -> %r" % _one_line(stderr, 200))
+    assert "Traceback" not in stderr, "missing file: a traceback leaked to stderr"
+    assert not os.path.exists(os.path.join(out_dir, "no-such-file", "report.json")), (
+        "missing file: a report.json was written for a file that does not exist")
+    return "missing file: exit %d, clean ERROR message, no report written" % proc.returncode
+
+
+# ---------------------------------------------------------------------------
+# Comparison between two files, and the HTML page. Both are checked on the REAL
+# artifacts written by the CLI: an HTML that is self-contained "by construction" is
+# only self-contained if the file on disk says so.
+# ---------------------------------------------------------------------------
+
+def _stem(file_name):
+    return os.path.splitext(file_name)[0]
+
+
+def analyzed(file_name, genre):
+    """pipeline.analyze_file on a signal, cached. Returns the data dict.
+
+    Whoever is going to MODIFY it makes a copy first: the object is shared between cases.
+    """
+    return _cache(("analyzed", file_name, genre),
+                  lambda: MODULES["pipeline"].analyze_file(signal_path(file_name), genre))
+
+
+def run_compare_cli(old_file, new_file, genre, brief=False, break_ffmpeg=False):
+    """Runs `python -m aisinestes old new --compare` and returns what came out.
+
+    Returns {"code", "stdout", "stderr", "folder", "report"} with `report` = compare.json.
+    break_ffmpeg works the same way as in run_cli: the variable points at a file that
+    exists and cannot be executed, which is the only reliable way to reproduce "no
+    ffmpeg" on a machine that has it.
+    """
+    key = ("cmpcli", old_file, new_file, genre, brief, break_ffmpeg)
+
+    def _run():
+        out_dir = os.path.join(CLI_OUT, "compare-%s-%s-%s%s%s" % (
+            _stem(old_file), _stem(new_file), genre, "-brief" if brief else "",
+            "-noffmpeg" if break_ffmpeg else ""))
+        shutil.rmtree(out_dir, ignore_errors=True)
+        env = dict(os.environ)
+        if break_ffmpeg:
+            env["AISINESTES_FFMPEG"] = signal_path(new_file)
+        cmd = [sys.executable, "-m", "aisinestes",
+               signal_path(old_file), signal_path(new_file),
+               "--compare", "--genre", genre, "--out", out_dir]
+        if brief:
+            cmd.append("--brief")
+        proc = subprocess.run(cmd, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=CLI_TIMEOUT)
+        folder = os.path.join(out_dir, "compare_%s_vs_%s" % (_stem(old_file),
+                                                             _stem(new_file)))
+        report = None
+        json_path = os.path.join(folder, "compare.json")
+        if os.path.exists(json_path):
+            with open(json_path, "r", encoding="utf-8") as fh:
+                report = json.load(fh)
+        return {
+            "code": proc.returncode,
+            "stdout": proc.stdout.decode("utf-8", errors="replace"),
+            "stderr": proc.stderr.decode("utf-8", errors="replace"),
+            "folder": folder,
+            "report": report,
+        }
+
+    return _cache(key, _run)
+
+
+def _find_metric(cmp, needle):
+    hits = [m for m in cmp["metrics"] if needle.lower() in str(m.get("name")).lower()]
+    assert hits, "no metric mentioning %r. There are: %s" % (
+        needle, ", ".join(str(m.get("name")) for m in cmp["metrics"]))
+    return hits[0]
+
+
+def _cmp_summary(cmp):
+    return " | ".join("%s %s->%s %s/%s" % (m["name"], m["old"], m["new"],
+                                           m["direction"], m["transition"])
+                      for m in cmp["metrics"])
+
+
+def chk_compare(old_file, new_file, genre, expect, require_mixed=False):
+    """
+    Compares two signals and checks the DIRECTION of each metric.
+
+    `expect` maps a piece of the metric name to the (direction, transition) pair that
+    metric has to come out with. The negative mode passes the directions the other way
+    round: if the comparison cannot tell an improvement from a regression, that
+    expectation comes out green and the case is worthless.
+
+    `require_mixed` demands that the same comparison contain at least one improvement AND
+    at least one regression. That is the situation the feature was built for — a round of
+    fixes that quietly costs a metric nobody was watching — and it needs to be asserted,
+    not assumed.
+    """
+    cmp = MODULES["compare"].compare(analyzed(old_file, genre), analyzed(new_file, genre))
+    assert cmp.get("metrics"), "compare() returned no metrics"
+    assert cmp["genre"] == genre, "compare() reports genre %r" % cmp["genre"]
+    for side, name in (("old", old_file), ("new", new_file)):
+        assert cmp[side]["file"] == name, (
+            "compare()['%s']['file'] = %r and the basename is %r (never the full path)"
+            % (side, cmp[side]["file"], name))
+
+    # Two invariants that hold for every metric of every comparison, checked here so no
+    # future profile can slip past them.
+    for m in cmp["metrics"]:
+        # A missing side is never a zero.
+        if m["old"] is None or m["new"] is None:
+            assert m["direction"] == "not_comparable", (
+                "%s: a side is missing and direction says %r" % (m["name"], m["direction"]))
+            assert m["delta"] is None, (
+                "%s: a side was never measured and a delta of %r came out — a made-up "
+                "number is worse than no number" % (m["name"], m["delta"]))
+        # A metric the profile has no reference for cannot be better or worse, however
+        # small the move: "unchanged" there is a judgement nobody is in a position to make.
+        if m.get("target") in ("-", None):
+            assert m["direction"] == "not_comparable", (
+                "%s: target is '-' (no reference in this profile) and direction says %r "
+                "-- with nothing to compare against, the only honest answer is "
+                "not_comparable" % (m["name"], m["direction"]))
+
+    for needle, (direction, transition) in expect.items():
+        m = _find_metric(cmp, needle)
+        assert m["direction"] == direction, (
+            "%s: direction %r, expected %r (old=%s new=%s delta=%s, target %s)"
+            % (m["name"], m["direction"], direction, m["old"], m["new"], m["delta"],
+               m["target"]))
+        assert m["transition"] == transition, (
+            "%s: transition %r, expected %r" % (m["name"], m["transition"], transition))
+
+    if require_mixed:
+        directions = {m["direction"] for m in cmp["metrics"]}
+        assert "improved" in directions and "worsened" in directions, (
+            "this comparison had to contain an improvement AND a regression at the same "
+            "time, and it contains %s" % sorted(directions))
+
+    return "%s -> %s (%s): %s" % (old_file, new_file, genre, _cmp_summary(cmp))
+
+
+def chk_compare_crossing(metric_name, target, old, new, status_old, status_new,
+                         expect_direction, expect_transition):
+    """
+    A check that CROSSES its threshold with a tiny step.
+
+    This is the one the epsilon got wrong: 0.05 absolute is wider than the whole decision
+    window of the small metrics (the attack lives between 0 and 0.15, the bite floor sits
+    at 0.16 %), so a move that flipped the verdict came out as "unchanged" sitting right
+    next to a transition of "broke". A direction that contradicts the gate is worse than
+    no direction at all, which is why the crossing now outranks the epsilon.
+
+    The two sides are built by hand, exactly in the shape targets.evaluate emits, because
+    what is under test is the arithmetic of the comparison and not the synthesis of a WAV
+    that would land on a given decimal.
+    """
+    item_old = {"check": metric_name, "measured": "%.3f" % old, "target": target,
+                "status": status_old}
+    item_new = {"check": metric_name, "measured": "%.3f" % new, "target": target,
+                "status": status_new}
+    data_old = {"genre": "fx-impact", "file": "before.wav", "checks": [item_old]}
+    data_new = {"genre": "fx-impact", "file": "after.wav", "checks": [item_new]}
+    cmp = MODULES["compare"].compare(data_old, data_new)
+    metric = _find_metric(cmp, metric_name)
+
+    assert metric["old"] == old and metric["new"] == new, (
+        "%s: the values did not survive the round trip -> old=%r new=%r"
+        % (metric_name, metric["old"], metric["new"]))
+    step = abs(new - old)
+    assert step < 0.05, (
+        "%s: the step is %.4f and this case only means something below the old absolute "
+        "epsilon of 0.05" % (metric_name, step))
+    assert metric["transition"] == expect_transition, (
+        "%s: transition %r, expected %r" % (metric_name, metric["transition"],
+                                            expect_transition))
+    assert metric["direction"] == expect_direction, (
+        "%s: %.3f -> %.3f (step %.4f) crossed the threshold %r and direction says %r, "
+        "expected %r — a direction that contradicts the transition is the bug"
+        % (metric_name, old, new, step, target, metric["direction"], expect_direction))
+    return "%s: %.3f -> %.3f (step %.4f) -> %s / %s" % (
+        metric_name, old, new, step, metric["direction"], metric["transition"])
+
+
+def chk_compare_brief(old_file, new_file, genre, expect_verdict,
+                      expect_unmeasured_lines=None, expect_code=None,
+                      break_ffmpeg=False):
+    """
+    Parses the --compare --brief output line by line, as a machine reading it would.
+
+    It has to obey the same rules as the single-file brief, because the same parser reads
+    both: the same four verdict words with their counts, a cap of 20 lines with whatever
+    does not fit COUNTED instead of dropped, and not one absolute path on any line — the
+    reasons inside UNMEASURED come straight out of ffmpeg and those do carry paths.
+    """
+    got = run_compare_cli(old_file, new_file, genre, brief=True, break_ffmpeg=break_ffmpeg)
+    lines = [ln for ln in got["stdout"].splitlines() if ln.strip()]
+    assert lines, "%s -> %s: --brief printed nothing. stderr: %s" % (
+        old_file, new_file, _one_line(got["stderr"], 200))
+    assert len(lines) <= 20, "the compare brief came out with %d lines, the cap is 20" % (
+        len(lines),)
+
+    head = lines[0]
+    assert head.startswith("AISINESTES COMPARE %s -> %s |" % (old_file, new_file)), (
+        "the first line is not 'AISINESTES COMPARE <old> -> <new> |' -> %r" % head)
+    for line in lines:
+        hint = absolute_path_hint(line)
+        assert hint is None, (
+            "the compare brief is leaking an absolute path (%r) -> %r" % (hint, line))
+    assert lines[1].startswith("VERDICT: %s" % expect_verdict), (
+        "expected 'VERDICT: %s' and got %r" % (expect_verdict, lines[1]))
+    assert "| old:" in lines[1], (
+        "the verdict line does not report the old side -> %r" % lines[1])
+    assert any(ln.startswith("files: ") for ln in lines), (
+        "the compare brief has no 'files:' line -> %r" % lines)
+    assert lines[-1] == "exit=%d" % got["code"], (
+        "the last brief line is %r and the process returned %d — a brief that lies about "
+        "its own exit code is worse than no brief" % (lines[-1], got["code"]))
+
+    unmeasured = [ln for ln in lines if ln.startswith("UNMEASURED ")]
+    if expect_unmeasured_lines is not None:
+        assert len(unmeasured) == expect_unmeasured_lines, (
+            "%d UNMEASURED lines expected in the compare brief, there are %d -> %s"
+            % (expect_unmeasured_lines, len(unmeasured),
+               _one_line(" / ".join(unmeasured), 300)))
+    if expect_code is not None:
+        assert got["code"] == expect_code, (
+            "the CLI returned %d and %d was expected" % (got["code"], expect_code))
+    return "%s -> %s (%s): %s | %d UNMEASURED | %d lines | exit %d" % (
+        old_file, new_file, genre, lines[1], len(unmeasured), len(lines), got["code"])
+
+
+def chk_compare_missing(file_name, genre, expect_delta):
+    """
+    The case of a metric that exists on one side and not on the other.
+
+    It reproduces something real: the same file measured twice, the second time on a
+    machine with no ffmpeg, so the loudness is gone. What must NEVER come out of that is
+    a delta: a zero there would read as "it did not change" when the truth is "nobody
+    knows". The negative mode demands exactly that zero.
+    """
+    old = copy.deepcopy(analyzed(file_name, genre))
+    assert old.get("loudness"), (
+        "%s: without real loudness on the old side this case proves nothing" % file_name)
+    new = copy.deepcopy(old)
+    new["loudness"] = None
+    new["unmeasured"] = list(new.get("unmeasured") or []) + [
+        "loudness (ebur128): absence reproduced by the harness"]
+    new["checks"] = MODULES["targets"].evaluate(new, genre)
+
+    cmp = MODULES["compare"].compare(old, new)
+    affected = [m for m in cmp["metrics"] if m["old"] is not None and m["new"] is None]
+    assert affected, (
+        "no metric lost its value on the new side, so there is nothing to prove here: %s"
+        % _cmp_summary(cmp))
+    for m in affected:
+        assert m["direction"] == "not_comparable", (
+            "%s: one side is missing and direction says %r" % (m["name"], m["direction"]))
+        if expect_delta is None:
+            assert m["delta"] is None, "%s: delta %r where there should be none" % (
+                m["name"], m["delta"])
+        else:
+            assert m["delta"] == expect_delta, "%s: delta %r, expected %r" % (
+                m["name"], m["delta"], expect_delta)
+    return "%s (%s): %d metrics with a side missing -> %s" % (
+        file_name, genre, len(affected),
+        ", ".join("%s delta=%r" % (m["name"], m["delta"]) for m in affected))
+
+
+def chk_compare_cli(old_file, new_file, genre, expect_code, expect_new_flags=None):
+    """
+    Runs the real comparison in a child process and checks that it gates on the NEW file.
+
+    The three output files have to be there and the exit code has to be explainable from
+    compare.json: a gate whose code cannot be traced back to the report is a gate nobody
+    can trust.
+    """
+    got = run_compare_cli(old_file, new_file, genre)
+    report = got["report"]
+    assert report is not None, ("%s -> %s: no compare.json was written in %s. stderr: %s"
+                                % (old_file, new_file, got["folder"],
+                                   _one_line(got["stderr"], 200)))
+    for name in ("compare.txt", "compare.json", "compare.html"):
+        assert os.path.exists(os.path.join(got["folder"], name)), (
+            "%s -> %s: %s was not written" % (old_file, new_file, name))
+
+    verdict = report.get("verdict")
+    assert verdict is not None, "compare.json has no 'verdict' block (keys: %s)" % sorted(
+        report)
+    assert got["code"] == expect_code, (
+        "%s -> %s (%s): the CLI returned %d and %d was expected. new=%s FLAG of %s, "
+        "old=%s FLAG of %s" % (old_file, new_file, genre, got["code"], expect_code,
+                               report["new"]["flags"], report["new"]["checks"],
+                               report["old"]["flags"], report["old"]["checks"]))
+    assert verdict["exit_code"] == got["code"], (
+        "compare.json says exit_code %r and the process returned %d"
+        % (verdict["exit_code"], got["code"]))
+    # The gate follows the NEW file: its flags, not the old one's, are what the code says.
+    assert verdict["flags"] == report["new"]["flags"], (
+        "the verdict counts %d FLAG and the new file has %d: the gate is reading the "
+        "wrong side" % (verdict["flags"], report["new"]["flags"]))
+    if expect_new_flags is not None:
+        assert report["new"]["flags"] == expect_new_flags, (
+            "%s: the new file has %d FLAG and %d were expected"
+            % (new_file, report["new"]["flags"], expect_new_flags))
+    assert isinstance(report.get("errors"), list), (
+        "compare.json has no 'errors' list: a failure of the derived artifacts would only "
+        "ever exist in a line of stderr that already scrolled past (keys: %s)"
+        % sorted(report))
+    for side in ("old", "new"):
+        for text in (report[side]["file"], report[side]["label"]):
+            assert os.sep not in text and "/" not in text, (
+                "compare.json is carrying a path instead of a basename: %r" % text)
+    return "%s -> %s (%s): exit %d, old %d FLAG / new %d FLAG" % (
+        old_file, new_file, genre, got["code"], report["old"]["flags"],
+        report["new"]["flags"])
+
+
+_DATA_URI_RE = re.compile(r"data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+
+
+def _strip_data_uris(text):
+    """Replaces the base64 payloads with a marker before searching the markup.
+
+    Not cosmetic: a few hundred kB of base64 can contain any four letters by chance, so
+    looking for "http" in the raw text would fail at random. What has to be checked is
+    the MARKUP, and this is what is left of it once the payloads are out of the way.
+    """
+    return _DATA_URI_RE.sub("data:image/png;base64,<payload>", text)
+
+
+def chk_html(kind, file_name, genre, other=None, must_contain=(), must_not_contain=(),
+             expect_data_uris=None, path_check="absolute"):
+    """
+    Checks a real HTML page written by the CLI.
+
+    Two properties are non-negotiable and both are checked on the file on disk:
+
+      - SELF-CONTAINED: not one external request. Every src= is a data: URI and there is
+        no <script>, <link>, @import, url() or iframe anywhere in the markup.
+      - NO PATHS: the page names the audio by basename and nothing else. It is the output
+        meant to be shared, and a local path is not the sharer's to publish.
+
+    path_check="absolute" asserts the absolute path of the signal is NOT in the page (the
+    real property). path_check="basename" asserts the BASENAME is not there either, which
+    is false — the negative mode uses it to prove that this detector can actually fail
+    when the string it looks for IS present.
+    """
+    if kind == "report":
+        got = run_cli(file_name, genre)
+        page = os.path.join(got["folder"], "report.html")
+    else:
+        got = run_compare_cli(file_name, other, genre)
+        page = os.path.join(got["folder"], "compare.html")
+    assert os.path.exists(page), "%s was not written. stderr: %s" % (
+        page, _one_line(got["stderr"], 200))
+
+    raw = open(page, "rb").read()
+    assert raw, "%s came out empty" % os.path.basename(page)
+    text = raw.decode("utf-8")          # not valid UTF-8 -> this blows up, as it should
+    markup = _strip_data_uris(text)
+
+    assert text.lstrip().lower().startswith("<!doctype html"), (
+        "%s does not start with a doctype -> %r" % (page, text[:40]))
+    assert "</html>" in text, "%s has no closing </html>" % page
+
+    for token in ("http:", "https:", "//", "<script", "<link", "@import", "url(",
+                  "<iframe", "xlink:href"):
+        assert token not in markup.lower(), (
+            "%s has %r in its markup: the page has to be self-contained, with zero "
+            "external requests" % (os.path.basename(page), token))
+
+    sources = [s for s in markup.split('src="')[1:]]
+    for source in sources:
+        assert source.startswith("data:"), (
+            "%s has a src that is not a data URI -> %r" % (page, source[:60]))
+    if expect_data_uris is not None:
+        assert len(sources) == expect_data_uris, (
+            "%s has %d embedded images and %d were expected"
+            % (os.path.basename(page), len(sources), expect_data_uris))
+
+    forbidden = signal_path(file_name) if path_check == "absolute" else file_name
+    assert forbidden not in text, (
+        "%s contains %r and it must not" % (os.path.basename(page), forbidden))
+    hint = absolute_path_hint(markup)
+    assert hint is None, (
+        "%s is leaking an absolute path (%r found)"
+        % (os.path.basename(page), hint))
+
+    for token in must_contain:
+        assert token in text, "%s does not contain %r" % (os.path.basename(page), token)
+    for token in must_not_contain:
+        assert token not in text, "%s contains %r and it must not" % (
+            os.path.basename(page), token)
+
+    return "%s: %d bytes, %d embedded image(s), %d bytes of markup, zero external refs" % (
+        os.path.basename(page), len(raw), len(sources), len(markup))
+
+
+HOSTILE_TOKENS = ("<script", "<link", "@import", "url(", "<iframe", "xlink:href",
+                  "http:", "https:")
+
+
+def chk_html_escaping(hostile_name, genre, require_raw_name=False):
+    """
+    A file name carrying HTML metacharacters has to come out ESCAPED on the page.
+
+    The page is built by string concatenation, so the one thing standing between a file
+    name and broken (or injected) markup is the escaping — and the name is the single
+    piece of attacker-controlled text that is SUPPOSED to be shown, which is exactly why
+    it deserves its own case. The name is created at runtime, used, and deleted: nothing
+    with a hostile name stays in the repository.
+
+    require_raw_name=True demands the unescaped name on the page, which is the bug this
+    guards against: the negative mode uses it to prove the assertion can fail.
+    """
+    work = os.path.join(CLI_OUT, "hostile")
+    out_dir = os.path.join(work, "out")
+    copy_path = os.path.join(work, hostile_name)
+    text = None
+    stderr = ""
+    code = None
+    try:
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
+        shutil.copyfile(signal_path("fx_roto.wav"), copy_path)
+        proc = subprocess.run(
+            [sys.executable, "-m", "aisinestes", copy_path, "--genre", genre,
+             "--out", out_dir],
+            cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=CLI_TIMEOUT)
+        code = proc.returncode
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        page = os.path.join(out_dir, os.path.splitext(hostile_name)[0], "report.html")
+        if os.path.exists(page):
+            text = open(page, "rb").read().decode("utf-8")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    assert text is not None, (
+        "no report.html was written for %r (exit %r). stderr: %s"
+        % (hostile_name, code, _one_line(stderr, 200)))
+
+    escaped = hostile_name.replace("&", "&amp;").replace("'", "&#x27;")
+    markup = _strip_data_uris(text)
+    for token in HOSTILE_TOKENS:
+        assert token not in markup.lower(), (
+            "the page for %r has %r in its markup" % (hostile_name, token))
+    assert escaped in text, (
+        "the escaped name %r is not on the page (it has to be shown, escaped)" % escaped)
+    if require_raw_name:
+        assert hostile_name in text, (
+            "the raw name %r is not on the page" % hostile_name)
+    else:
+        assert hostile_name not in text, (
+            "the RAW name %r is on the page: a file name is text, and text that reaches "
+            "markup unescaped is how a name becomes a tag" % hostile_name)
+    return "%r -> escaped as %r, %d bytes, zero external refs, copy deleted" % (
+        hostile_name, escaped, len(text))
+
+
+def _verdict_summary(verdict):
+    return "flags=%s/%s, unmeasured=%d" % (
+        verdict.get("flags"), verdict.get("checks"),
+        len(verdict.get("unmeasured") or []))
+
+
 def _fmt_bands(bb):
     return ", ".join("%s=%.2f" % (n, float(bb.get(n, 0.0)))
                      for n, _l, _h in ms.CONTRACT_BANDS)
@@ -563,6 +1244,275 @@ CASES = [
          pos=dict(file_name="fx_bueno.wav", genre="fx-impact", no_flags=True),
          neg=dict(file_name="fx_roto.wav", genre="fx-impact", no_flags=True),
          neg_note="zero FLAGs are demanded on the BROKEN impact (98 % in sub)"),
+
+    # --- Exit codes: 0 measured-and-clean · 1 flag · 3 clean-but-incomplete ---------
+    # fx-impact is used because none of its four checks needs ffmpeg: with ffmpeg out of
+    # the picture the checks still all come out OK and what is left is exactly the case
+    # code 3 exists for — nothing to complain about AMONG WHAT WAS MEASURED.
+    dict(id="e01-exit3-incomplete", family="exitcode",
+         req=("targets", "wavio", "analyze", "ffreport"), fn=chk_cli_exit, timeout=120.0,
+         pos=dict(file_name="fx_bueno.wav", genre="fx-impact", break_ffmpeg=True,
+                  expect_code=3, expect_flags=0, expect_unmeasured=True),
+         neg=dict(file_name="fx_bueno.wav", genre="fx-impact", break_ffmpeg=True,
+                  expect_code=0, expect_flags=0, expect_unmeasured=True),
+         neg_note="exit 0 is demanded from a run where loudness could not be measured"),
+
+    # The mirror image, and the one that proves the 3 is not a constant: the SAME file and
+    # the SAME profile, with ffmpeg working, have to come out 0 with nothing unmeasured.
+    dict(id="e02-exit0-complete", family="exitcode",
+         req=("targets", "wavio", "analyze", "ffreport"), fn=chk_cli_exit, ffmpeg=True,
+         timeout=120.0,
+         pos=dict(file_name="fx_bueno.wav", genre="fx-impact",
+                  expect_code=0, expect_flags=0, expect_unmeasured=False),
+         neg=dict(file_name="fx_bueno.wav", genre="fx-impact",
+                  expect_code=3, expect_flags=0, expect_unmeasured=False),
+         neg_note="exit 3 (incomplete) is demanded from a run where everything WAS measured"),
+
+    # Precedence: with FLAGs *and* unmeasured metrics at the same time, 1 wins over 3.
+    dict(id="e03-flag-wins", family="exitcode",
+         req=("targets", "wavio", "analyze", "ffreport"), fn=chk_cli_exit, timeout=120.0,
+         pos=dict(file_name="fx_roto.wav", genre="fx-impact", break_ffmpeg=True,
+                  expect_code=1, expect_flags=3, expect_unmeasured=True),
+         neg=dict(file_name="fx_roto.wav", genre="fx-impact", break_ffmpeg=True,
+                  expect_code=3, expect_flags=3, expect_unmeasured=True),
+         neg_note="exit 3 is demanded where there are 3 FLAGs (the flag has to win)"),
+
+    # --- --brief: the format is parsed line by line, as an agent would --------------
+    dict(id="q01-brief-flag", family="brief",
+         req=("targets", "wavio", "analyze", "ffreport"), fn=chk_brief, timeout=120.0,
+         pos=dict(file_name="fx_roto.wav", genre="fx-impact",
+                  expect_verdict="FLAG", expect_flag_lines=3, expect_code=1),
+         neg=dict(file_name="fx_bueno.wav", genre="fx-impact",
+                  expect_verdict="FLAG", expect_flag_lines=3, expect_code=1),
+         neg_note="a FLAG verdict with 3 FLAG lines is demanded of the HEALTHY impact"),
+
+    # CLEAN, unlike INCOMPLETE, requires everything to have been measured: this one needs
+    # a real ffmpeg, and without it the case is skipped instead of coming out green.
+    dict(id="q02-brief-clean", family="brief",
+         req=("targets", "wavio", "analyze", "ffreport"), fn=chk_brief, ffmpeg=True,
+         timeout=120.0,
+         pos=dict(file_name="fx_bueno.wav", genre="fx-impact",
+                  expect_verdict="CLEAN", expect_flag_lines=0, expect_code=0),
+         neg=dict(file_name="fx_roto.wav", genre="fx-impact",
+                  expect_verdict="CLEAN", expect_flag_lines=0, expect_code=0),
+         neg_note="a CLEAN brief with zero FLAG lines is demanded of the BROKEN impact"),
+
+    # Genre "none" judges nothing: the brief must say NOT JUDGED instead of claiming a
+    # CLEAN pass nobody ever tested for. Needs real ffmpeg (without it the same run is
+    # INCOMPLETE, which is a different true statement).
+    dict(id="n01-brief-not-judged", family="brief",
+         req=("targets", "wavio", "analyze", "ffreport"), fn=chk_brief, ffmpeg=True,
+         timeout=120.0,
+         pos=dict(file_name="fx_bueno.wav", genre="none",
+                  expect_verdict="NOT JUDGED", expect_flag_lines=0, expect_code=0),
+         neg=dict(file_name="fx_bueno.wav", genre="none",
+                  expect_verdict="CLEAN", expect_flag_lines=0, expect_code=0),
+         neg_note="a CLEAN verdict is demanded where nothing was judged (genre none)"),
+
+    # Digital silence has no band SHARES (0/0 is not 0 %): the impact gate must flag all
+    # four checks as unmeasurable instead of waving "0.00 % OK" rows through.
+    dict(id="s02-silence-gate", family="silence",
+         req=("targets", "wavio", "analyze", "ffreport"), fn=chk_cli_exit, timeout=120.0,
+         pos=dict(file_name="silence.wav", genre="fx-impact",
+                  expect_code=1, expect_flags=4),
+         neg=dict(file_name="silence.wav", genre="fx-impact",
+                  expect_code=1, expect_flags=0),
+         neg_note="zero flags are demanded of pure silence under the impact gate"),
+
+    # The oldest error route, now guarded: a missing input file is exit 2 with a clear
+    # message, never a traceback and never a half report.
+    dict(id="err01-missing-file", family="errors",
+         req=("targets", "wavio", "analyze", "ffreport"), fn=chk_missing_file,
+         timeout=60.0,
+         pos=dict(expect_code=2),
+         neg=dict(expect_code=0),
+         neg_note="exit 0 is demanded from a run whose input file does not exist"),
+
+    # --- --compare: the direction of each metric, by the MEANING of its check ---------
+    # fx_roto -> fx_bueno: everything that was wrong gets fixed. The negative asks for
+    # the opposite directions: a comparison that cannot tell an improvement from a
+    # regression would pass both, and then it is measuring nothing.
+    dict(id="y01-compare-directions", family="compare",
+         req=("compare", "pipeline", "targets", "wavio", "analyze"), fn=chk_compare,
+         timeout=90.0,
+         pos=dict(old_file="fx_roto.wav", new_file="fx_bueno.wav", genre="fx-impact",
+                  expect={"Sub magnitude": ("improved", "fixed"),
+                          "Body magnitude": ("improved", "fixed"),
+                          "Bite magnitude": ("improved", "fixed"),
+                          "Fast attack": ("unchanged", "still_ok")}),
+         neg=dict(old_file="fx_roto.wav", new_file="fx_bueno.wav", genre="fx-impact",
+                  expect={"Sub magnitude": ("worsened", "broke"),
+                          "Body magnitude": ("worsened", "broke"),
+                          "Bite magnitude": ("worsened", "broke"),
+                          "Fast attack": ("unchanged", "still_ok")}),
+         neg_note="the directions are inverted: the three fixed metrics are required "
+                  "to read as regressions"),
+
+    # ⭐ THE CASE THIS FEATURE EXISTS FOR: a round of fixes that costs you a metric.
+    # fx_roto -> fx_swell repairs the whole spectral balance (sub, body and bite all come
+    # back into range) and breaks the attack, which nobody was watching. The comparison
+    # has to show BOTH things at once — that is what `require_mixed` demands.
+    dict(id="y02-compare-regression", family="compare",
+         req=("compare", "pipeline", "targets", "wavio", "analyze"), fn=chk_compare,
+         timeout=90.0,
+         pos=dict(old_file="fx_roto.wav", new_file="fx_swell.wav", genre="fx-impact",
+                  require_mixed=True,
+                  expect={"Sub magnitude": ("improved", "fixed"),
+                          "Body magnitude": ("improved", "fixed"),
+                          "Bite magnitude": ("improved", "fixed"),
+                          "Fast attack": ("worsened", "broke")}),
+         neg=dict(old_file="fx_roto.wav", new_file="fx_swell.wav", genre="fx-impact",
+                  require_mixed=True,
+                  expect={"Sub magnitude": ("improved", "fixed"),
+                          "Fast attack": ("improved", "fixed")}),
+         neg_note="the metric that BROKE (the attack) is required to read as fixed"),
+
+    # A side that was never measured is not a zero. techno-club is used because its
+    # loudness checks are the ones that disappear without ffmpeg.
+    dict(id="y03-compare-missing-side", family="compare",
+         req=("compare", "pipeline", "targets", "wavio", "analyze", "ffreport"),
+         fn=chk_compare_missing, ffmpeg=True, timeout=90.0,
+         pos=dict(file_name="fx_bueno.wav", genre="techno-club", expect_delta=None),
+         neg=dict(file_name="fx_bueno.wav", genre="techno-club", expect_delta=0.0),
+         neg_note="a delta of 0.0 is demanded from a metric that was never measured"),
+
+    # The comparison gates on the NEW file: same two signals, swapped round, opposite
+    # exit code. Run as a real child process, because the gate IS the exit code.
+    dict(id="y04-compare-gate-clean", family="compare",
+         req=("compare", "htmlreport", "pipeline", "targets", "wavio", "analyze",
+              "ffreport"), fn=chk_compare_cli, timeout=120.0,
+         pos=dict(old_file="fx_roto.wav", new_file="fx_bueno.wav", genre="fx-impact",
+                  expect_code=0, expect_new_flags=0),
+         neg=dict(old_file="fx_roto.wav", new_file="fx_bueno.wav", genre="fx-impact",
+                  expect_code=1, expect_new_flags=0),
+         neg_note="exit 1 is demanded from a comparison whose NEW file is clean"),
+
+    dict(id="y05-compare-gate-flag", family="compare",
+         req=("compare", "htmlreport", "pipeline", "targets", "wavio", "analyze",
+              "ffreport"), fn=chk_compare_cli, timeout=120.0,
+         pos=dict(old_file="fx_bueno.wav", new_file="fx_roto.wav", genre="fx-impact",
+                  expect_code=1, expect_new_flags=3),
+         neg=dict(old_file="fx_bueno.wav", new_file="fx_roto.wav", genre="fx-impact",
+                  expect_code=0, expect_new_flags=3),
+         neg_note="exit 0 is demanded from a comparison whose NEW file has 3 FLAGs "
+                  "(the old one being clean must not save it)"),
+
+    # The third kind of reference: a RANGE, where "better" is neither up nor down but
+    # closer. Under techno-club both files sit far below the sub window, so moving up is
+    # an improvement that is still a FLAG — a state no other case reaches — while the
+    # true peak (a ceiling) goes the other way and breaks.
+    dict(id="y06-compare-range", family="compare",
+         req=("compare", "pipeline", "targets", "wavio", "analyze", "ffreport"),
+         fn=chk_compare, ffmpeg=True, timeout=120.0,
+         pos=dict(old_file="white_noise.wav", new_file="fx_bueno.wav",
+                  genre="techno-club", require_mixed=True,
+                  expect={"Sub magnitude": ("improved", "still_flag"),
+                          "Sub+bass magnitude": ("improved", "still_flag"),
+                          "True peak": ("worsened", "broke")}),
+         neg=dict(old_file="white_noise.wav", new_file="fx_bueno.wav",
+                  genre="techno-club", require_mixed=True,
+                  expect={"Sub magnitude": ("improved", "fixed"),
+                          "True peak": ("worsened", "broke")}),
+         neg_note="a metric that moved towards its window without reaching it is "
+                  "required to read as 'fixed'"),
+
+    # ⭐ The epsilon bug: a step of 0.05 that FLIPS the verdict. Both directions of the
+    # crossing, on the two metrics whose whole decision window is smaller than the old
+    # absolute epsilon. The negative asks for "unchanged", which is what it used to say.
+    dict(id="y07-crossing-outranks-eps", family="compare",
+         req=("compare", "pipeline", "targets"), fn=chk_compare_crossing, timeout=60.0,
+         pos=dict(metric_name="Fast attack (envelope peak)",
+                  target="<= 0.15 of duration (first 15 %)",
+                  old=0.13, new=0.18, status_old="OK", status_new="FLAG",
+                  expect_direction="worsened", expect_transition="broke"),
+         neg=dict(metric_name="Fast attack (envelope peak)",
+                  target="<= 0.15 of duration (first 15 %)",
+                  old=0.13, new=0.18, status_old="OK", status_new="FLAG",
+                  expect_direction="unchanged", expect_transition="broke"),
+         neg_note="'unchanged' is demanded of a step that crossed the threshold and "
+                  "broke the check"),
+
+    dict(id="y08-crossing-fixed", family="compare",
+         req=("compare", "pipeline", "targets"), fn=chk_compare_crossing, timeout=60.0,
+         pos=dict(metric_name="Bite magnitude (2000 Hz and up)", target=">= 0.16 %",
+                  old=0.13, new=0.17, status_old="FLAG", status_new="OK",
+                  expect_direction="improved", expect_transition="fixed"),
+         neg=dict(metric_name="Bite magnitude (2000 Hz and up)", target=">= 0.16 %",
+                  old=0.13, new=0.17, status_old="FLAG", status_new="OK",
+                  expect_direction="unchanged", expect_transition="fixed"),
+         neg_note="'unchanged' is demanded of a step that crossed the threshold and "
+                  "fixed the check"),
+
+    # The comparison brief, parsed like the single-file one: same verdict words, same
+    # cap, no absolute path anywhere. With ffmpeg out of the picture the new file comes
+    # out INCOMPLETE, which is what puts an UNMEASURED line in there to check.
+    dict(id="y09-compare-brief", family="compare",
+         req=("compare", "htmlreport", "pipeline", "targets", "wavio", "analyze",
+              "ffreport"), fn=chk_compare_brief, timeout=120.0,
+         pos=dict(old_file="fx_roto.wav", new_file="fx_bueno.wav", genre="fx-impact",
+                  break_ffmpeg=True, expect_verdict="INCOMPLETE (0 of 4, 1 unmeasured)",
+                  expect_unmeasured_lines=1, expect_code=3),
+         neg=dict(old_file="fx_roto.wav", new_file="fx_bueno.wav", genre="fx-impact",
+                  break_ffmpeg=True, expect_verdict="CLEAN",
+                  expect_unmeasured_lines=1, expect_code=3),
+         neg_note="a CLEAN verdict is demanded of a comparison whose new file could not "
+                  "measure its loudness"),
+
+    dict(id="y10-compare-brief-not-judged", family="compare",
+         req=("compare", "htmlreport", "pipeline", "targets", "wavio", "analyze",
+              "ffreport"), fn=chk_compare_brief, ffmpeg=True, timeout=120.0,
+         pos=dict(old_file="fx_roto.wav", new_file="fx_bueno.wav", genre="none",
+                  expect_verdict='NOT JUDGED (0 checks: genre "none")',
+                  expect_unmeasured_lines=0, expect_code=0),
+         neg=dict(old_file="fx_roto.wav", new_file="fx_bueno.wav", genre="none",
+                  expect_verdict="CLEAN", expect_unmeasured_lines=0, expect_code=0),
+         neg_note="a CLEAN verdict is demanded of a comparison where nothing was judged"),
+
+    # --- report.html / compare.html: self-contained, and no paths --------------------
+    dict(id="h01-html-selfcontained", family="html",
+         req=("htmlreport", "pipeline", "targets", "wavio", "analyze", "ffreport"),
+         fn=chk_html, ffmpeg=True, timeout=120.0,
+         pos=dict(kind="report", file_name="fx_roto.wav", genre="fx-impact",
+                  expect_data_uris=2,
+                  must_contain=("fx_roto.wav", ">FLAG<", "data:image/png;base64,")),
+         neg=dict(kind="report", file_name="fx_roto.wav", genre="fx-impact",
+                  expect_data_uris=5,
+                  must_contain=("fx_roto.wav", ">FLAG<", "data:image/png;base64,")),
+         neg_note="5 embedded images are demanded from a page that has 2"),
+
+    # The privacy rule, and the proof that the detector for it can fail: with
+    # path_check="basename" it looks for a string that IS on the page.
+    dict(id="h02-html-no-path", family="html",
+         req=("htmlreport", "pipeline", "targets", "wavio", "analyze", "ffreport"),
+         fn=chk_html, ffmpeg=True, timeout=120.0,
+         pos=dict(kind="report", file_name="fx_roto.wav", genre="fx-impact",
+                  path_check="absolute"),
+         neg=dict(kind="report", file_name="fx_roto.wav", genre="fx-impact",
+                  path_check="basename"),
+         neg_note="the BASENAME is required to be absent from a page that shows it"),
+
+    dict(id="h03-compare-html", family="html",
+         req=("compare", "htmlreport", "pipeline", "targets", "wavio", "analyze",
+              "ffreport"), fn=chk_html, timeout=120.0,
+         pos=dict(kind="compare", file_name="fx_roto.wav", other="fx_bueno.wav",
+                  genre="fx-impact", expect_data_uris=0,
+                  must_contain=("fx_roto.wav", "fx_bueno.wav", "improved", "fixed"),
+                  must_not_contain=("worsened",)),
+         neg=dict(kind="compare", file_name="fx_roto.wav", other="fx_bueno.wav",
+                  genre="fx-impact", expect_data_uris=0,
+                  must_contain=("fx_roto.wav", "fx_bueno.wav", "improved", "worsened")),
+         neg_note="the word 'worsened' is demanded from a comparison where nothing "
+                  "got worse"),
+
+    # A file name is attacker-controlled text that the page is SUPPOSED to display. The
+    # copy is made at runtime with characters Windows allows and HTML does not, used, and
+    # deleted — nothing hostile is stored in the repository.
+    dict(id="h04-html-escaping", family="html",
+         req=("htmlreport", "pipeline", "targets", "wavio", "analyze", "ffreport"),
+         fn=chk_html_escaping, timeout=120.0,
+         pos=dict(hostile_name="a&b'c.wav", genre="fx-impact"),
+         neg=dict(hostile_name="a&b'c.wav", genre="fx-impact", require_raw_name=True),
+         neg_note="the RAW unescaped name is demanded on a page that escapes it"),
 ]
 
 
@@ -680,7 +1630,7 @@ def main(argv):
     print("=" * 96)
     print("signals: %s" % SIG_DIR)
     print("modules:")
-    for m in ("wavio", "analyze", "ffreport", "targets"):
+    for m in MODULE_NAMES:
         if MODULES[m] is not None:
             print("  aisinestes.%-10s PRESENT" % m)
         else:

@@ -3,6 +3,7 @@ ffmpeg.local
 
 # Documento de diseño interno. Lo que valía la pena de él está contado en el README.
 CONTRATO.md
+CONTRATO-LOTE2.md
 
 # Notas de revisión internas (en castellano). Lo que salió de ellas está aplicado en el
 # README y en docs/; el documento de trabajo no se publica.

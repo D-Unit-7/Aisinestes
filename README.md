@@ -11,8 +11,8 @@ you can wire into CI.
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![Core](https://img.shields.io/badge/core-stdlib%20only-brightgreen)
 ![FFmpeg](https://img.shields.io/badge/ffmpeg-optional-yellow)
-![Tests](https://img.shields.io/badge/tests-34%20passing-brightgreen)
-![Negatives](https://img.shields.io/badge/proven%20negatives-17-orange)
+![Tests](https://img.shields.io/badge/tests-78%20passing-brightgreen)
+![Negatives](https://img.shields.io/badge/proven%20negatives-39-orange)
 ![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-lightgrey)
 
 </div>
@@ -122,6 +122,9 @@ The same track, measured before and after a round of corrections driven by these
 The spectral balance was the target and it moved into range. Loudness improved by 10.6 LU
 and still flags.
 
+*The reference column is the `techno-club` profile's own window, not a published standard —
+see [docs/references.md](docs/references.md) for what backs each of its five values.*
+
 **And one metric got worse.** Pushing the level flattened the dynamics further — the
 loudness range fell from 0.80 LU to 0.10. Nobody noticed at the time; the tool did, on a
 later measurement. That is the argument for the whole project in one line: an unmeasured
@@ -135,9 +138,12 @@ fix is a guess about which trade you just made.
 out/<filename>/
 ├── report.txt        the readable verdict shown above
 ├── report.json       every raw metric, for machines
+├── report.html       the same report as one self-contained page, safe to share
 ├── spectrogram.png   log-frequency, ~15 Hz-13 kHz, honest dB legend   (needs ffmpeg)
 └── waveform.png      full waveform                                     (needs ffmpeg)
 ```
+
+The parent folder is `out` by default and moves with `--out DIR`.
 
 Without `ffmpeg` you still get both reports and every spectral check; you lose the two
 images and the EBU R128 loudness metrics.
@@ -149,8 +155,20 @@ images and the EBU R128 loudness metrics.
 | exit code | meaning |
 |:---:|---|
 | `0` | everything measured, no flags |
-| `1` | at least one flag, or a metric couldn't be measured |
-| `2` | couldn't produce a report at all |
+| `1` | at least one flag — the audio was judged and it failed |
+| `2` | couldn't produce a report at all (missing file, unsupported WAV) |
+| `3` | no flags, but at least one metric was never measured — for example `fx-impact` with no `ffmpeg` (its four checks pass, loudness stays unknown) |
+
+A flag outranks a missing metric: a run with both returns `1`. Code `3` exists so a gate
+can tell *clean* apart from *clean as far as it got*, and decide on purpose which of the
+two it accepts. `report.json` carries the same thing in its `verdict` block
+(`flags`, `checks`, `unmeasured`, `exit_code`).
+
+One consequence worth knowing: when a profile **checks** a metric that could not be
+measured — `techno-club` checks loudness, so no `ffmpeg` means three of its checks have no
+data — those checks fail closed as `FLAG` and the run exits `1`, not `3`. A gate never
+goes green, or even "incomplete", on something it was explicitly asked to judge and
+couldn't.
 
 ```bash
 # fail the build if any new sound effect is broken
@@ -159,8 +177,104 @@ for f in assets/sfx/*.wav; do
 done
 ```
 
+That loop fails on `3` as well, which is usually what you want on CI: a check that never
+ran is not a check that passed. To accept incomplete runs, test for exit code `1` instead.
+
 Measurable technical failures get caught before subjective review, and every flag says
 what to inspect.
+
+---
+
+## The short output
+
+The full report is written for a person looking at a screen. `--brief` is written for
+whatever reads output by the line — a coding agent, a CI log, a script:
+
+```bash
+python -m aisinestes techno.wav --genre techno-club --brief
+```
+
+```
+AISINESTES techno.wav | genre=techno-club v1 | 7.273s 48000Hz
+VERDICT: FLAG (4 of 5)
+FLAG Sub magnitude (20-60 Hz): 42.25 % vs 18.00 to 26.00 % (reference ≈ 22 %)
+FLAG Sub+bass magnitude (20-120 Hz): 52.21 % vs 48.00 to 52.00 %
+FLAG Integrated loudness (LUFS-I): -22.70 LUFS vs -8.00 to -6.00 LUFS
+FLAG Loudness range (LRA): 0.80 LU vs 5.00 to 8.00 LU
+files: out/techno/
+exit=1
+```
+
+It writes exactly the same files as a normal run; what changes is what it prints. The
+checks that passed are left out on purpose — a summary that lists everything costs the
+same to read as the report it summarises. What stays is what changes a decision.
+
+The shape is fixed and bounded: at most twenty lines, one item per line, four of them
+always there (header, verdict, `files:`, `exit=`). When more failures turn up than fit,
+the rest are **counted** in a last line that names the file holding all of them — a
+truncated list that looks complete is worse than a long one. No line ever carries an
+absolute path: the audio is named by basename and even the reasons `ffmpeg` gives are
+scrubbed, because this is the output most likely to be pasted somewhere else.
+
+The verdict is one of four words:
+
+| word | means |
+|---|---|
+| `CLEAN` | every check passed, everything measured |
+| `FLAG` | at least one check failed |
+| `INCOMPLETE` | nothing failed, but something was never measured |
+| `NOT JUDGED` | the profile has no checks — nothing was tested |
+
+The fourth exists because the alternative was a lie. With `--genre none` there are zero
+checks and therefore zero failures, and calling that `CLEAN` would claim a pass nobody
+ever tested for. For the same reason, **`--genre none` cannot be used as a gate**: it
+measures, it never fails, and in CI it produces a green light that tested nothing.
+
+`--brief` works with `--compare` too, and keeps the same shape — see
+[docs/cli-and-outputs.md](docs/cli-and-outputs.md) for both formats in full.
+
+---
+
+## Compare two versions
+
+```bash
+python -m aisinestes before.wav after.wav --compare --genre fx-impact
+```
+
+```
+  metric                           old      new      delta    direction  transition
+  -------------------------------  -------  -------  -------  ---------  ----------
+  Sub magnitude (20-60 Hz)         98.890   2.120    -96.770  improved   fixed
+  Body magnitude (120-2000 Hz)     0.060    9.680    +9.620   improved   fixed
+  Bite magnitude (2000 Hz and up)  0.130    88.020   +87.890  improved   fixed
+  Fast attack (envelope peak)      0.000    0.510    +0.510   worsened   broke
+```
+
+Three metrics repaired and one broken in the same round of fixes: the same kind of trade
+this README opens with, except caught while it happens instead of on a later measurement.
+(The four rows above are the real output for those two files, minus the `target` column
+and the loudness rows, which the terminal prints too.)
+
+`direction` reads the *meaning* of each check, not the sign of the difference: for a
+ceiling, going down is better; for a floor, going up is better; for a range, getting
+closer to it is better. Crossing the threshold outranks everything else — if the check
+flipped, the direction says so however small the step was. A metric the profile has no
+reference for still shows its real delta, and says it cannot judge it. A side that was
+never measured comes out `not comparable` — never as a zero.
+
+**The comparison gates on the new file.** Its verdict is the exit code, with the same
+four codes as a single run: the old file is context, not a vote. Outputs go to
+`out/compare_<old>_vs_<new>/` as `compare.txt`, `compare.json` and `compare.html`, and
+`--brief` prints one line per metric instead of the table.
+
+### The HTML report
+
+Every run also writes `report.html`, and `--compare` writes `compare.html`: the same
+verdict, tables and images as one **self-contained** page — inline CSS, the PNGs embedded
+as data URIs, zero external requests of any kind. It names the audio by basename and
+never carries the path it was measured from, which is what makes it the one output safe
+to hand to somebody else. No generation timestamp either: two runs over the same file
+produce the same bytes, so a diff between two pages is about the audio.
 
 ---
 
@@ -172,8 +286,8 @@ what to inspect.
 - **It supports short game sound effects, not only full music tracks.** Impacts fail in
   ways a music profile cannot see.
 - **It can be used as a command-line quality gate**, with an exit code and no interactive step.
-- **Its test suite includes explicit negative cases that must fail.** Seventeen of the
-  thirty-four cases exist purely to prove the other seventeen aren't lying.
+- **Its test suite includes explicit negative cases that must fail.** Thirty-nine of the
+  seventy-eight cases exist purely to prove the other thirty-nine aren't lying.
 
 ---
 
@@ -224,13 +338,13 @@ python harness/run_harness.py
 ```
 
 ```
-SUMMARY: 34 cases in 3.8 s -> PASS=34
+SUMMARY: 78 cases in 10.1 s -> PASS=78
 EXIT 0 (all PASS)
 ```
 
 Each positive detector test has a corresponding negative case that must fail — and the
 suite verifies that it actually fails. A detector that cannot be made to fail isn't
-detecting anything. The ten WAV fixtures are generated from code (sine waves, filtered
+detecting anything. The eleven WAV fixtures are generated from code (sine waves, filtered
 noise, exponential decays) and can be recreated bit for bit; no samples, no licences,
 nothing borrowed.
 
@@ -242,6 +356,7 @@ Details: [docs/testing-strategy.md](docs/testing-strategy.md).
 
 | document | what's in it |
 |---|---|
+| [cli-and-outputs.md](docs/cli-and-outputs.md) | every flag, every file a run writes, exit codes, and what each output guarantees |
 | [measurement-methodology.md](docs/measurement-methodology.md) | magnitude vs power, FFT, window, hop, frame sampling, bands |
 | [calibration.md](docs/calibration.md) | how the thresholds were derived, and what that does and doesn't prove |
 | [testing-strategy.md](docs/testing-strategy.md) | positive and negative cases, synthetic signals, cross-checks |
@@ -259,12 +374,16 @@ Stated plainly, because a tool that judges should be judged back:
 - **WAV only** (PCM 16/24/32-bit and IEEE float32). No MP3, no FLAC.
 - **Two calibrated profiles.** Broad genre coverage is not the goal; calibrated coverage is.
 - **BPM is an estimate**, reported as such and never used as a check.
-- **The thresholds are calibration baselines, not universal audio standards.** They were
-  derived from a 105-sound reference set; independent validation against a separate
-  labelled dataset is planned and has not been done. See
+- **The `fx-impact` thresholds are calibration baselines, not universal audio standards.**
+  They were derived from a 105-sound reference set; independent validation against a
+  separate labelled dataset is planned and has not been done. See
   [docs/calibration.md](docs/calibration.md).
-- **The `techno-club` reference values still need their primary sources documented.** See
-  [docs/references.md](docs/references.md).
+- **The `techno-club` band thresholds are heuristics, not calibrated values.** Their
+  provenance was traced in full on 2026-07-30: of its five values, the true-peak ceiling
+  holds up against EBU R128 and the loudness window against a secondary source, one value
+  was misread from its source, and two have no source at all. The profile is useful for
+  catching gross problems and should not be quoted as a reference. The whole audit, with
+  what each source actually says, is in [docs/references.md](docs/references.md).
 - It evaluates measurable spectral and dynamic properties. It cannot tell you whether a
   sound is *good* — only whether it matches the reference you asked it to match.
 
@@ -303,7 +422,7 @@ afterwards. Copies obtained under MIT keep the rights granted at that time; ever
 the relicensing commit onward is under the terms above. This is not an open-source licence
 by the OSI definition, and the project does not claim to be one.*
 
-The ten test signals are generated by the included code and carry no third-party rights.
+The eleven test signals are generated by the included code and carry no third-party rights.
 The `fx-impact` profile was calibrated by measuring sounds from
 [Kenney's](https://kenney.nl/) public-domain library; no audio from it ships in this
 repository.

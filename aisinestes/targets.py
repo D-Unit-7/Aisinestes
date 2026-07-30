@@ -1,12 +1,11 @@
 """Per-genre references and metric evaluation.
 
 This is where the thresholds an audio file gets judged against live, together with the
-function that compares what was measured against them. The values come out of the
-26-jul research written down in CONTRATO.md; no genre and no reference gets added
-outside of that.
+function that compares what was measured against them. Every value's derivation is
+documented in docs/calibration.md; no genre and no reference gets added without one.
 
 ⚠️ CONVENTION: the per-band percentages split spectral MAGNITUDE |X|, not power |X|²
-(decision of 27-jul, documented in the fft_bands block of CONTRATO.md). The fx-impact
+(settled by experiment — see docs/measurement-methodology.md). The fx-impact
 thresholds are expressed in that convention and were recalibrated by measuring real
 professional impacts — see the derivation of each one below. Changing the fft_bands
 convention forces this calibration to be redone.
@@ -36,6 +35,10 @@ GENRES = {
     "techno-club": {
         "description": "Techno meant for a club system: bass up front and high "
                        "loudness, but no digital clipping.",
+        # Profile version. It gets BUMPED whenever any threshold below moves, so a report
+        # can be told apart from one produced under different references. The pending
+        # independent validation is expected to move them (see docs/calibration.md).
+        "version": "1",
         # sub (<60 Hz) ≈ 22 % of the total energy. Window 18-26 % (22 ± 4).
         "sub_pct": (22.0 - TECHNO_SUB_TOLERANCE, 22.0 + TECHNO_SUB_TOLERANCE),
         # sub + bass (<120 Hz) between 48 and 52 % of the total energy: half the
@@ -61,6 +64,8 @@ GENRES = {
     "fx-impact": {
         "description": "Sound-effect hit/impact: it has to sound short, with body "
                        "and with edge, not like a sub rumble.",
+        # Profile version: bumped whenever any threshold below moves (same rule as above).
+        "version": "1",
         # Sub ceiling. Measured: the real impact with the MOST sub out of the 105 is
         # impactMining_004 at 44.24 % (next come 32.04 and 23.44). The broken case
         # sits at 98.89 %. 60 % lands almost in the middle of the 44.24 -> 98.89 gap:

@@ -25,6 +25,19 @@ And not:
 **These thresholds are calibration baselines.** Independent validation against a separate,
 manually labelled dataset is planned and has not been done.
 
+## Profiles are versioned
+
+Every profile that judges anything carries a `version` string (`fx-impact` and
+`techno-club` are both at **v1**), and it shows up in each report: `Genre: fx-impact
+(profile v1)` in the text report, `"profile_version": "1"` in the JSON. The `none` profile
+has no version — it judges nothing.
+
+The version gets **bumped whenever any threshold in that profile moves**. Two reports
+carrying different versions were not judged against the same references, and comparing
+their verdicts without noticing that is exactly the kind of silent mistake this whole
+document exists to prevent. The independent validation described below is expected to move
+thresholds, so this number is expected to change.
+
 ## The reference set
 
 **105 impact sounds** from [Kenney's public-domain library](https://kenney.nl/) (CC0):
@@ -102,9 +115,18 @@ case, so it stays where the original specification put it.
 The sub window is a symmetric ±4 percentage points around the single-point reference of
 22 %, chosen to be the same order as the width of the sub+bass window (±2 around 50).
 
-These values came from published mastering references for the style rather than from
-taste. **The specific primary sources were not recorded at the time** and need to be
-documented before the values should be treated as citable — see
+**These values were not calibrated the way `fx-impact` was, and they should not be read as
+if they had been.** Their provenance was traced in full on 2026-07-30: they come from a
+single web search whose result summary was never checked against the pages themselves. Of
+the five, the true-peak ceiling holds up against EBU R128 and the loudness window against a
+secondary source; the sub figure was misread from its source (22 % is an observed average
+of amateur uploads, not a target); and the sub+bass window and the LRA range have no source
+at all. The source also measures in a different convention over different bands, so its
+figures are not transferable without a conversion that was never made.
+
+No threshold was moved on that finding — importing the source's numbers would carry its
+convention with them. Closing this properly means measuring a reference set of club masters
+the way `fx-impact` was measured. The value-by-value audit is in
 [references.md](references.md).
 
 ## The deliberately flawed reference sample

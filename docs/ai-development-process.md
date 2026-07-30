@@ -41,6 +41,13 @@ from inside the workflow that produced it:
 
 Roughly double the sub-bass it should have had, and about 15 dB quieter than club level.
 
+*The reference column here and below is the `techno-club` profile the tool judges against,
+not a published standard. That profile's provenance was audited afterwards and does not
+all hold up — of its five values, two are supported, one was misread from its source and
+two have no source at all; see [references.md](references.md). It does not change the
+diagnosis in this case, where the gaps are far wider than any plausible correction to the
+references, but the column should be read for what it is.*
+
 ### The same blind spot, on sound effects
 
 Then it appeared again, worse, because this time it shipped. Two impact effects were sent
@@ -65,7 +72,8 @@ adjust, with every change driven by a number rather than a guess:
 | integrated loudness | −22.70 LUFS 🚩 | **−12.10 LUFS** 🚩 | −8 to −6 |
 | loudness range | 0.80 LU 🚩 | **0.10 LU** 🚩 | 5–8 |
 
-The spectral balance moved into range. The loudness improved by 10.6 LU and still flags.
+The spectral balance moved into range against the profile's own windows (see the note
+above on what backs them). The loudness improved by 10.6 LU and still flags.
 
 **And the loudness range got worse — 0.80 LU down to 0.10.** Pushing the level flattened
 the dynamics further. This was not noticed at the time; it surfaced on a later measurement,
@@ -139,7 +147,7 @@ the README.
 
 ## How the result was verified
 
-- **34 harness cases, 17 of them negative**, run before every change is considered done.
+- **78 harness cases, 39 of them negative**, run before every change is considered done.
 - **Cross-check against a reference implementation** where one exists, with its scope
   stated narrowly rather than overclaimed — see [testing-strategy.md](testing-strategy.md).
 - **Real project audio**, not only synthetic fixtures: the tool's first real job was
@@ -158,16 +166,3 @@ It is not a demonstration that an AI can be pointed at a problem and left alone.
 failure listed above was caught by a human deciding what to check, by a contract written in
 advance, or by a test built specifically to fail — and several of them would have shipped
 silently otherwise.
-
----
-
-<!-- The two sections below are the repository owner's to write in his own words.
-     They are deliberately left as prompts rather than filled in by the assistant. -->
-
-## What I still don't fully control
-
-*(to be written by the repository owner)*
-
-## What I learned
-
-*(to be written by the repository owner)*

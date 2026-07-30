@@ -337,6 +337,47 @@ def gen_fx_bueno(dur_s=0.5):
     return _normalize_peak(xs, 0.9)
 
 
+def gen_fx_swell(dur_s=0.5):
+    """
+    IMPACT THAT IS NOT AN IMPACT: the same three layers as the healthy one, but the
+    energy swells towards the middle of the file instead of hitting at the start.
+    (It produces fx_swell.wav.)
+
+    It exists for the comparison: measured against fx_roto.wav, three metrics get
+    dramatically better (sub, body and bite all come back into range) while a fourth
+    one, the attack, breaks. That is the situation the whole feature was built for — a
+    round of fixes that quietly costs you a metric nobody was looking at — and a test
+    for it needs a signal where the directions genuinely disagree.
+
+    The layers keep the gains of the healthy impact so the spectral balance stays
+    comfortably inside the fx-impact references; the only thing that changes is WHEN
+    the sound happens. The envelope is a raised cosine peaking at half the duration,
+    so the peak lands around 0.5 of the file against a threshold of 0.15.
+    """
+    n = _n_samples(dur_s)
+    xs = [0.0] * n
+
+    _mix(xs, _sine(45.0, dur_s, FXB_GAIN_THUD))
+
+    body = _sine(800.0, dur_s, FXB_GAIN_BODY)
+    body2 = _sine(1300.0, dur_s, FXB_GAIN_BODY * 0.5)
+    for i in range(n):
+        body[i] += body2[i]
+    _mix(xs, body)
+
+    rnd = random.Random(SEED_CRACK)
+    noise = [rnd.uniform(-1.0, 1.0) for _ in range(n)]
+    emphasis = _bandpass_biquad(list(noise), 5000.0, 1.1)
+    for i in range(n):
+        xs[i] += FXB_GAIN_CRACK * (0.75 * emphasis[i] + 0.25 * noise[i])
+
+    # Raised cosine over the whole file: zero at both ends, maximum exactly at the
+    # middle. No decay anywhere, so the envelope peak cannot land early.
+    for i in range(n):
+        xs[i] *= 0.5 - 0.5 * math.cos(2.0 * math.pi * i / n)
+    return _normalize_peak(xs, 0.9)
+
+
 # ---------------------------------------------------------------------------
 # Declared truth of each signal (what the harness takes as given)
 # ---------------------------------------------------------------------------
@@ -366,13 +407,16 @@ TRUTHS = [
      "truth": "healthy impact: thud + body 800/1300 Hz + crack ~5 kHz, fast attack"},
     {"file": "sine_1khz_float32.wav", "dur": 3.0, "peak_db": -20.0, "tol_db": 0.10,
      "truth": "IEEE float32: same waveform as sine_1khz.wav (same integers/32768)"},
+    {"file": "fx_swell.wav", "dur": 0.5, "peak_db": -0.915, "tol_db": 0.10,
+     "truth": "swell, not an impact: the layers of the healthy one with the energy "
+              "peaking at the middle -> spectral balance in range, attack FLAG"},
 ]
 
 TRUTH_BY_FILE = {v["file"]: v for v in TRUTHS}
 
 
 def generate_all():
-    """Generates and writes the 10 signals. Returns a list of lines for the log."""
+    """Generates and writes the 11 signals. Returns a list of lines for the log."""
     os.makedirs(SIG_DIR, exist_ok=True)
     log = []
 
@@ -400,6 +444,7 @@ def generate_all():
 
     w16("fx_roto.wav", gen_fx_roto())
     w16("fx_bueno.wav", gen_fx_bueno())
+    w16("fx_swell.wav", gen_fx_swell())
 
     # The float32 is derived from the SAME integers as the PCM16: that way the comparison
     # "float32 vs PCM16 gives the same numbers" tests the reading branch and nothing else.
@@ -611,7 +656,7 @@ def independent_bands(samples, rate, n_fft=8192, hop=4096, max_frames=12):
 def measure_spectra():
     """Table of the real spectral balance of the signals that depend on it."""
     of_interest = ["sine_50hz.wav", "sine_1khz.wav", "sine_10khz.wav", "white_noise.wav",
-                   "fx_roto.wav", "fx_bueno.wav"]
+                   "fx_roto.wav", "fx_bueno.wav", "fx_swell.wav"]
     rows = []
     for name in of_interest:
         path = os.path.join(SIG_DIR, name)
